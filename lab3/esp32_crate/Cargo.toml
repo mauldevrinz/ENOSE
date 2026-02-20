@@ -1,0 +1,21 @@
+[package]
+name = "esp32_enose"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = "0.51"
+esp-idf-sys = "0.36"
+esp-idf-hal = "0.45"
+anyhow = "1.0"
+bme68x-rust = { git = "https://github.com/chakflying/bme68x-rust" }
+heapless = "0.8"
+
+[build-dependencies]
+embuild = "0.33"
+
+[[bin]]
+name = "esp32_enose"
+path = "src/main.rs"

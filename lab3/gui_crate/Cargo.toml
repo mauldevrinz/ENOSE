@@ -1,0 +1,14 @@
+[package]
+name = "lab3"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ eframe = { version = "0.24", features = ["default"] }
+ egui = "0.24"
+ serialport = "4.2"
+ egui_plot = "0.24"
+ chrono = "0.4"
+
+ [target.'cfg(windows)'.dependencies]
+ winapi = { version = "0.3", features = ["winuser", "windef"] }
