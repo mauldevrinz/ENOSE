@@ -1,18 +1,7 @@
-// Cargo.toml dependencies:
-// [dependencies]
-// eframe = { version = "0.24", features = ["default"] }
-// egui = "0.24"
-// serialport = "4.2"
-// egui_plot = "0.24"
-// chrono = "0.4"
-//
-// [target.'cfg(windows)'.dependencies]
-// winapi = { version = "0.3", features = ["winuser", "windef"] }
-
 use eframe::egui;
 use egui::{Color32, RichText, Stroke};
-use egui_plot::{Line, Plot, PlotPoints, Legend, Corner};
-use std::collections::HashMap;
+use egui_plot::{Line, Plot, PlotPoints};
+use std::collections::{HashMap, BTreeMap};
 use std::fs::File;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -29,11 +18,9 @@ struct DataPoint {
 
 #[derive(Clone)]
 struct EnvironmentData {
-    timestamp: f64,
-    // BME688 - Gas Sampling Chamber
+    _timestamp: f64,
     sample_temp: f64,
     sample_humid: f64,
-    // AHT25 - Object Chamber
     chamber_temp: f64,
     chamber_humid: f64,
 }
@@ -55,7 +42,7 @@ struct SerialMonitorApp {
     received_data: Arc<Mutex<Vec<String>>>,
     plot_data: Arc<Mutex<Vec<DataPoint>>>,
     environment_data: Arc<Mutex<Vec<EnvironmentData>>>,
-    channels: HashMap<String, ChannelData>,
+    channels: BTreeMap<String, ChannelData>,
     serial_thread: Option<thread::JoinHandle<()>>,
     stop_signal: Arc<Mutex<bool>>,
     show_graph: bool,
@@ -72,7 +59,6 @@ struct SerialMonitorApp {
     serial_port: Option<Box<dyn std::io::Write + Send>>,
     current_cycle_status: Arc<Mutex<String>>,
     current_valve_state: Arc<Mutex<(u8, u8, u8, u8)>>,
-    pending_sensor_map: Arc<Mutex<HashMap<String, f64>>>,
 }
 
 #[derive(PartialEq, Clone)]
@@ -100,7 +86,7 @@ impl Default for SerialMonitorApp {
             received_data: Arc::new(Mutex::new(Vec::new())),
             plot_data: Arc::new(Mutex::new(Vec::new())),
             environment_data: Arc::new(Mutex::new(Vec::new())),
-            channels: HashMap::new(),
+            channels: BTreeMap::new(),
             serial_thread: None,
             stop_signal: Arc::new(Mutex::new(false)),
             show_graph: true,
@@ -117,26 +103,90 @@ impl Default for SerialMonitorApp {
             serial_port: None,
             current_cycle_status: Arc::new(Mutex::new("---".to_string())),
             current_valve_state: Arc::new(Mutex::new((0, 0, 0, 0))),
-            pending_sensor_map: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
+/// ✅ ULTRA FIX: Extract only numeric part dari raw_str
+/// Karena ada karakter aneh yang menempel, kita extract hanya angka + titik + minus
+fn extract_number_from_string(s: &str) -> String {
+    s.chars()
+        .take_while(|c| c.is_numeric() || *c == '.' || *c == '-')
+        .collect()
+}
+
+/// ✅ CRITICAL FIX: Robust parsing untuk handle Gas_Volt_mV
 fn parse_sensors_into(sensors_content: &str, map: &mut HashMap<String, f64>) {
-    for entry in sensors_content.split(", ") {
-        if let Some((name_part, val_part)) = entry.split_once(": ") {
+    // Hapus prefix SENSORS: jika ada
+    let trimmed_content = sensors_content.trim();
+    let content = if trimmed_content.starts_with("SENSORS:") {
+        &trimmed_content["SENSORS:".len()..]
+    } else {
+        trimmed_content
+    };
+    
+    // Split by comma
+    let entries: Vec<&str> = content.split(',').collect();
+    
+    for (idx, entry) in entries.iter().enumerate() {
+        let entry = entry.trim();
+        if entry.is_empty() { 
+            continue; 
+        }
+        
+        // Hapus prefix SENSORS: jika ada
+        let entry = if entry.starts_with("SENSORS:") {
+            &entry["SENSORS:".len()..]
+        } else {
+            entry
+        };
+        let entry = entry.trim();
+        
+        if let Some((name_part, val_part)) = entry.split_once(':') {
             let name_trimmed = name_part.trim();
-            let (key, raw_val) = if let Some(v) = val_part.strip_prefix("val=") {
-                (name_trimmed.to_string(), v.trim())
-            } else if let Some(v) = val_part.strip_prefix("raw=") {
-                let key = name_trimmed.replace(" (", "_").replace(')', "");
-                (key, v.trim())
+            let val_trimmed = val_part.trim();
+            
+            let (mut key, raw_str, is_raw) = if let Some(v) = val_trimmed.strip_prefix("val=") {
+                (name_trimmed.to_string(), v.trim(), false)
+            } else if let Some(v) = val_trimmed.strip_prefix("raw=") {
+                let key = name_trimmed
+                    .replace(" (", "_")
+                    .replace(')', "")
+                    .trim()
+                    .to_string();
+                (key, v.trim(), true)
             } else {
+                println!("⚠️ UNPARSED ENTRY: name='{}' val='{}'", name_trimmed, val_trimmed);
                 continue;
             };
-            if let Ok(value) = raw_val.parse::<f64>() {
-                map.insert(key, value);
+
+            // Aggressive trim untuk key
+            key = key.trim().to_string();
+            key = key.trim_matches(|c: char| c.is_whitespace() || c == '\r' || c == '\n').to_string();
+            
+            // ✅ ULTRA FIX: Extract hanya angka dari raw_str
+            // Karena mungkin ada karakter debug output yang menempel
+            let cleaned_raw_str = extract_number_from_string(raw_str);
+            
+            println!("DEBUG: key='{}' raw_str='{}' -> cleaned='{}'", key, raw_str, cleaned_raw_str);
+
+            if let Ok(value) = cleaned_raw_str.parse::<f64>() {
+                let final_value = if is_raw {
+                    (value / 4095.0) * 3300.0
+                } else {
+                    value
+                };
+                
+                println!("✅ PARSED: key='{}' (idx={}, is_last={}), value={}", 
+                    key, idx, idx == entries.len() - 1, final_value);
+                
+                map.insert(key, final_value);
+            } else {
+                println!("❌ PARSE FAILED: key='{}' raw_str='{}' cleaned_raw_str='{}' (cannot parse as f64)", 
+                    key, raw_str, cleaned_raw_str);
             }
+        } else {
+            println!("⚠️ NO COLON: entry='{}'", entry);
         }
     }
 }
@@ -177,7 +227,6 @@ impl SerialMonitorApp {
                 self.available_ports.push(port.port_name);
             }
         }
-        // Fallback: manually check common Linux serial ports not listed by serialport crate
         for pattern in &["/dev/ttyACM", "/dev/ttyUSB", "/dev/ttyS"] {
             for i in 0..10 {
                 let port = format!("{}{}", pattern, i);
@@ -194,14 +243,14 @@ impl SerialMonitorApp {
 
     fn get_channel_color(index: usize) -> Color32 {
         let colors = [
-            Color32::from_rgb(52, 152, 219),   // Blue
-            Color32::from_rgb(231, 76, 60),    // Red
-            Color32::from_rgb(46, 204, 113),   // Green
-            Color32::from_rgb(241, 196, 15),   // Yellow
-            Color32::from_rgb(155, 89, 182),   // Purple
-            Color32::from_rgb(26, 188, 156),   // Turquoise
-            Color32::from_rgb(230, 126, 34),   // Orange
-            Color32::from_rgb(236, 240, 241),  // Silver
+            Color32::from_rgb(52, 152, 219),
+            Color32::from_rgb(231, 76, 60),
+            Color32::from_rgb(46, 204, 113),
+            Color32::from_rgb(241, 196, 15),
+            Color32::from_rgb(155, 89, 182),
+            Color32::from_rgb(26, 188, 156),
+            Color32::from_rgb(230, 126, 34),
+            Color32::from_rgb(236, 240, 241),
         ];
         colors[index % colors.len()]
     }
@@ -216,7 +265,6 @@ impl SerialMonitorApp {
         let data_format = self.data_format.clone();
         let current_cycle_status = Arc::clone(&self.current_cycle_status);
         let current_valve_state = Arc::clone(&self.current_valve_state);
-        let pending_sensor_map = Arc::clone(&self.pending_sensor_map);
         
         *stop_signal.lock().unwrap() = false;
         self.start_time = std::time::SystemTime::now()
@@ -247,7 +295,11 @@ impl SerialMonitorApp {
                                 line_buffer.push_str(&data);
 
                                 while let Some(pos) = line_buffer.find('\n') {
-                                    let line = line_buffer[..pos].trim().to_string();
+                                    let line = line_buffer[..pos]
+                                        .trim()
+                                        .trim_matches(|c: char| c.is_whitespace() || c == '\r' || c == '\n')
+                                        .to_string();
+                                    
                                     if !line.is_empty() {
                                         let current_time = std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
@@ -270,25 +322,13 @@ impl SerialMonitorApp {
                                             }
                                             DataFormat::CommaSeparated => {
                                                 let mut map = HashMap::new();
-                                                for part in line.split(',') {
-                                                    if let Some((key, val)) = part.split_once(':') {
-                                                        if let Ok(value) = val.trim().parse::<f64>() {
-                                                            map.insert(key.trim().to_string(), value);
-                                                        }
-                                                    }
-                                                }
+                                                parse_sensors_into(&line, &mut map);
                                                 map
                                             }
                                             DataFormat::JsonLike => {
                                                 let mut map = HashMap::new();
                                                 let cleaned = line.trim().trim_start_matches('{').trim_end_matches('}');
-                                                for part in cleaned.split(',') {
-                                                    if let Some((key, val)) = part.split_once(':') {
-                                                        if let Ok(value) = val.trim().parse::<f64>() {
-                                                            map.insert(key.trim().to_string(), value);
-                                                        }
-                                                    }
-                                                }
+                                                parse_sensors_into(cleaned, &mut map);
                                                 map
                                             }
                                             DataFormat::Esp32 => {
@@ -296,103 +336,76 @@ impl SerialMonitorApp {
                                                 if let Some(idx) = line.find("esp32_enose: ") {
                                                     let content = &line[idx + "esp32_enose: ".len()..];
 
-                                                    if content.starts_with("STATE:") {
-                                                        // Line 1: STATE:...,V_IN=... | SENSORS:H2S (D4): raw=..., Smoke (D7): raw=...
-                                                        let parts: Vec<&str> = content.splitn(2, " | ").collect();
+                                                    let parts: Vec<&str> = content.splitn(2, " | ").collect();
 
-                                                        // Parse STATE section
-                                                        if let Some(state_content) = parts[0].strip_prefix("STATE:") {
-                                                            let mut status = String::from("---");
-                                                            let mut v_in: u8 = 0;
-                                                            let mut p_in: u8 = 0;
-                                                            let mut v_out: u8 = 0;
-                                                            let mut p_out: u8 = 0;
-                                                            for kv in state_content.split(',') {
-                                                                if let Some((k, v)) = kv.split_once('=') {
-                                                                    match k.trim() {
-                                                                        "STATUS" => status = v.trim().to_string(),
-                                                                        "V_IN"   => v_in  = v.trim().parse().unwrap_or(0),
-                                                                        "P_IN"   => p_in  = v.trim().parse().unwrap_or(0),
-                                                                        "V_OUT"  => v_out = v.trim().parse().unwrap_or(0),
-                                                                        "P_OUT"  => p_out = v.trim().parse().unwrap_or(0),
-                                                                        _ => {}
-                                                                    }
-                                                                }
-                                                            }
-                                                            *current_cycle_status.lock().unwrap() = status;
-                                                            *current_valve_state.lock().unwrap() = (v_in, p_in, v_out, p_out);
-                                                        }
-
-                                                        // Parse partial SENSORS from line 1, store in pending
-                                                        let mut pending = pending_sensor_map.lock().unwrap();
-                                                        pending.clear();
-                                                        if let Some(sensors_part) = parts.get(1) {
-                                                            if let Some(sensors_content) = sensors_part.strip_prefix("SENSORS:") {
-                                                                parse_sensors_into(sensors_content, &mut pending);
-                                                            }
-                                                        }
-                                                        // No DataPoint emitted yet — wait for line 2
-                                                    } else if content.starts_with("SENSORS:") {
-                                                        // Line 2: SENSORS:H2S (D15): raw=..., Temp: val=...
-                                                        if let Some(sensors_content) = content.strip_prefix("SENSORS:") {
-                                                            // Merge pending (line 1 sensors) into map
-                                                            {
-                                                                let pending = pending_sensor_map.lock().unwrap();
-                                                                map.extend(pending.clone());
-                                                            }
-                                                            parse_sensors_into(sensors_content, &mut map);
-
-                                                            // Update environment data
-                                                            let sensor_temp = map.get("Temp").copied().unwrap_or(0.0);
-                                                            let sensor_humid = map.get("Hum").copied().unwrap_or(0.0);
-                                                            if sensor_temp > 0.0 || sensor_humid > 0.0 {
-                                                                let mut env_data = environment_data.lock().unwrap();
-                                                                env_data.push(EnvironmentData {
-                                                                    timestamp: current_time,
-                                                                    sample_temp: 0.0,
-                                                                    sample_humid: 0.0,
-                                                                    chamber_temp: 0.0,
-                                                                    chamber_humid: 0.0,
-                                                                });
-                                                                if env_data.len() > 500 {
-                                                                    env_data.remove(0);
+                                                    // Parse STATE section
+                                                    if let Some(state_content) = parts[0].strip_prefix("STATE:") {
+                                                        let mut status = String::from("---");
+                                                        let mut v_in: u8 = 0;
+                                                        let mut p_in: u8 = 0;
+                                                        let mut v_out: u8 = 0;
+                                                        let mut p_out: u8 = 0;
+                                                        for kv in state_content.split(',') {
+                                                            if let Some((k, v)) = kv.split_once('=') {
+                                                                match k.trim() {
+                                                                    "STATUS" => status = v.trim().to_string(),
+                                                                    "V_IN"   => v_in  = v.trim().parse().unwrap_or(0),
+                                                                    "P_IN"   => p_in  = v.trim().parse().unwrap_or(0),
+                                                                    "V_OUT"  => v_out = v.trim().parse().unwrap_or(0),
+                                                                    "P_OUT"  => p_out = v.trim().parse().unwrap_or(0),
+                                                                    _ => {}
                                                                 }
                                                             }
                                                         }
+                                                        *current_cycle_status.lock().unwrap() = status;
+                                                        *current_valve_state.lock().unwrap() = (v_in, p_in, v_out, p_out);
                                                     }
+
+                                                    // Parse SENSORS section
+                                                    if let Some(sensors_part) = parts.get(1) {
+                                                        if let Some(sensors_content) = sensors_part.strip_prefix("SENSORS:") {
+                                                            parse_sensors_into(sensors_content, &mut map);
+                                                        }
+                                                    } else if let Some(sensors_content) = parts[0].strip_prefix("SENSORS:") {
+                                                        parse_sensors_into(sensors_content, &mut map);
+                                                    }
+                                                    
+                                                    println!("=== TOTAL PARSED: {} keys ===", map.len());
                                                 }
                                                 map
                                             }
                                         };
 
                                         if !values.is_empty() {
-                                            // Store main sensor data
                                             let mut plot = plot_data.lock().unwrap();
                                             plot.push(DataPoint {
                                                 timestamp: current_time,
                                                 values: values.clone(),
                                                 raw_text: line.clone(),
                                             });
-                                            if plot.len() > 500 {
+                                            if plot.len() > 5000 {
                                                 plot.remove(0);
                                             }
 
-                                            // Extract environment data if available
-                                            let sample_temp = values.get("sample_temp").copied().unwrap_or(0.0);
-                                            let sample_humid = values.get("sample_humid").copied().unwrap_or(0.0);
-                                            let chamber_temp = values.get("chamber_temp").copied().unwrap_or(0.0);
-                                            let chamber_humid = values.get("chamber_humid").copied().unwrap_or(0.0);
-
-                                            if sample_temp > 0.0 || sample_humid > 0.0 || chamber_temp > 0.0 || chamber_humid > 0.0 {
+                                            let s_temp = values.get("sample_temp").copied().unwrap_or(
+                                                values.get("Temp").copied().unwrap_or(0.0)
+                                            );
+                                            let s_humid = values.get("sample_humid").copied().unwrap_or(
+                                                values.get("Hum").copied().unwrap_or(0.0)
+                                            );
+                                            let c_temp = values.get("chamber_temp").copied().unwrap_or(0.0);
+                                            let c_humid = values.get("chamber_humid").copied().unwrap_or(0.0);
+                                            
+                                            if s_temp != 0.0 || s_humid != 0.0 || c_temp != 0.0 || c_humid != 0.0 {
                                                 let mut env_data = environment_data.lock().unwrap();
                                                 env_data.push(EnvironmentData {
-                                                    timestamp: current_time,
-                                                    sample_temp,
-                                                    sample_humid,
-                                                    chamber_temp,
-                                                    chamber_humid,
+                                                    _timestamp: current_time,
+                                                    sample_temp: s_temp,
+                                                    sample_humid: s_humid,
+                                                    chamber_temp: c_temp,
+                                                    chamber_humid: c_humid,
                                                 });
-                                                if env_data.len() > 500 {
+                                                if env_data.len() > 5000 {
                                                     env_data.remove(0);
                                                 }
                                             }
@@ -460,11 +473,19 @@ impl SerialMonitorApp {
         let mut all_channels = std::collections::HashSet::new();
         for point in plot_data.iter() {
             for key in point.values.keys() {
-                // Skip environment data from main channels
-                if !key.contains("temp") && !key.contains("humid") && !key.contains("sample_") && !key.contains("chamber_")
-                    && !matches!(key.as_str(), "STATUS" | "V_IN" | "P_IN" | "V_OUT" | "P_OUT"
-                        | "Temp" | "Hum" | "Press" | "Gas_Ohm" | "Gas_Volt")
-                {
+                let is_gas_volt = key == "Gas_Volt_mV";
+                
+                let is_excluded = !is_gas_volt && (
+                    key.contains("temp") 
+                    || key.contains("humid") 
+                    || key.contains("sample_") 
+                    || key.contains("chamber_")
+                    || matches!(key.as_str(), 
+                        "STATUS" | "V_IN" | "P_IN" | "V_OUT" | "P_OUT"
+                        | "Temp" | "Hum" | "Press" | "Gas_Ohm")
+                );
+                
+                if is_gas_volt || !is_excluded {
                     all_channels.insert(key.clone());
                 }
             }
@@ -473,6 +494,9 @@ impl SerialMonitorApp {
         let mut channel_index = self.channels.len();
         for channel_name in all_channels {
             if !self.channels.contains_key(&channel_name) {
+                let mut data = self.received_data.lock().unwrap();
+                data.push(format!("✨ Detected new sensor channel: {}", channel_name));
+                
                 self.channels.insert(
                     channel_name.clone(),
                     ChannelData {
@@ -581,7 +605,7 @@ impl SerialMonitorApp {
                 ui.vertical(|ui| {
                     ui.label("🌡️ Sample Chamber Temperature & Humidity");
                     ui.label("🌡️ Sensor Chamber Temperature & Humidity");
-                    ui.label("📊 Multi-channel gas sensor data");
+                    ui.label("📊 Multi-channel gas sensor data (8+ channels)");
                     ui.label("💾 CSV export dengan timestamp");
                     ui.label("📈 Real-time graphing & analytics");
                     ui.label("🎨 Multiple themes support");
@@ -600,7 +624,7 @@ impl SerialMonitorApp {
             ui.label(RichText::new("Data Format Example:")
                 .size(14.0)
                 .strong());
-            ui.label(RichText::new("I (20552) esp32_enose: STATE:STATUS=IDLE,V_IN=1,P_IN=0,V_OUT=1,P_OUT=0 | SENSORS:H2S (D4): raw=363, Temp: val=25.67, ...")
+            ui.label(RichText::new("I (20552) esp32_enose: STATE:STATUS=IDLE,V_IN=1,P_IN=0,V_OUT=1,P_OUT=0 | SENSORS:H2S (D4): raw=525, ..., Gas_Volt_mV: val=2186")
                 .size(11.0)
                 .color(Color32::GRAY)
                 .monospace());
@@ -614,7 +638,6 @@ impl eframe::App for SerialMonitorApp {
         ctx.request_repaint();
         self.update_channels();
 
-        // Modern Top Bar
         egui::TopBottomPanel::top("top_panel")
             .exact_height(60.0)
             .show(ctx, |ui| {
@@ -663,7 +686,6 @@ impl eframe::App for SerialMonitorApp {
                 ui.add_space(10.0);
             });
 
-        // Sidebar
         egui::SidePanel::left("control_panel")
             .min_width(300.0)
             .max_width(320.0)
@@ -674,7 +696,6 @@ impl eframe::App for SerialMonitorApp {
                     .show(ui, |ui| {
                     ui.add_space(15.0);
                     
-                    // Connection Panel
                     egui::Frame::group(ui.style())
                         .fill(if matches!(self.theme, Theme::Dark | Theme::Blue) {
                             Color32::from_rgb(30, 35, 45)
@@ -720,7 +741,6 @@ impl eframe::App for SerialMonitorApp {
 
                     ui.add_space(12.0);
 
-                    // Data Format Panel
                     egui::Frame::group(ui.style())
                         .fill(if matches!(self.theme, Theme::Dark | Theme::Blue) {
                             Color32::from_rgb(30, 35, 45)
@@ -754,7 +774,6 @@ impl eframe::App for SerialMonitorApp {
 
                     ui.add_space(12.0);
 
-                    // Control Buttons
                     ui.vertical(|ui| {
                         if ui.add_sized(
                             [ui.available_width(), 35.0],
@@ -795,7 +814,6 @@ impl eframe::App for SerialMonitorApp {
 
                     ui.add_space(12.0);
 
-                    // CSV Export Panel
                     egui::Frame::group(ui.style())
                         .fill(Color32::from_rgb(52, 152, 219).linear_multiply(0.1))
                         .inner_margin(15.0)
@@ -830,7 +848,6 @@ impl eframe::App for SerialMonitorApp {
 
                     ui.add_space(12.0);
 
-                    // Display Options
                     egui::Frame::group(ui.style())
                         .inner_margin(15.0)
                         .show(ui, |ui| {
@@ -848,7 +865,6 @@ impl eframe::App for SerialMonitorApp {
 
                     ui.add_space(12.0);
 
-                    // ESP32 Cycle Status Panel
                     egui::Frame::group(ui.style())
                         .fill(if matches!(self.theme, Theme::Dark | Theme::Blue) {
                             Color32::from_rgb(30, 35, 45)
@@ -890,7 +906,6 @@ impl eframe::App for SerialMonitorApp {
 
                     ui.add_space(12.0);
 
-                    // Channels
                     if !self.channels.is_empty() {
                         egui::Frame::group(ui.style())
                             .inner_margin(15.0)
@@ -898,28 +913,31 @@ impl eframe::App for SerialMonitorApp {
                                 ui.label(RichText::new("📡 Gas Sensors").size(16.0).strong());
                                 ui.add_space(8.0);
                                 
-                                for (name, channel) in self.channels.iter_mut() {
-                                    ui.horizontal(|ui| {
-                                        ui.checkbox(&mut channel.visible, "");
-                                        ui.label(RichText::new("●").size(16.0).color(channel.color));
-                                        ui.label(RichText::new(name).strong());
-                                        
-                                        if channel.visible && !channel.points.is_empty() {
-                                            let last_val = channel.points.last().unwrap().1;
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                ui.label(RichText::new(format!("{:.2}", last_val))
-                                                    .size(12.0)
-                                                    .color(Color32::GRAY));
-                                            });
-                                        }
-                                    });
-                                }
-                            });
-                        
-                        ui.add_space(12.0);
+                                    egui::ScrollArea::vertical()
+                                        .max_height(200.0)
+                                        .show(ui, |ui| {
+                                            for (name, channel) in self.channels.iter_mut() {
+                                                ui.horizontal(|ui| {
+                                                    ui.checkbox(&mut channel.visible, "");
+                                                    ui.label(RichText::new("●").size(16.0).color(channel.color));
+                                                    ui.label(RichText::new(name).strong());
+                                                    
+                                                    if channel.visible && !channel.points.is_empty() {
+                                                        let last_val = channel.points.last().unwrap().1;
+                                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                            ui.label(RichText::new(format!("{:.2}", last_val))
+                                                                .size(12.0)
+                                                                .color(Color32::GRAY));
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                        });
+                                });
+                            
+                            ui.add_space(12.0);
                     }
 
-                    // Statistics Panel
                     if self.show_stats {
                         egui::Frame::group(ui.style())
                             .fill(Color32::from_rgb(26, 188, 156).linear_multiply(0.1))
@@ -980,7 +998,6 @@ impl eframe::App for SerialMonitorApp {
                 });
             });
 
-        // Main Content
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.show_welcome && !self.is_connected {
                 self.draw_welcome_screen(ui);
@@ -990,7 +1007,6 @@ impl eframe::App for SerialMonitorApp {
                     .show(ui, |ui| {
                         ui.add_space(10.0);
                         
-                        // Environment Graphs Section
                         if self.show_environment_graphs {
                             let env_data = self.environment_data.lock().unwrap();
                             
@@ -999,104 +1015,32 @@ impl eframe::App for SerialMonitorApp {
                                 ui.add_space(10.0);
                                 
                                 ui.columns(2, |columns| {
-                                    // Column 1: Gas Chamber (BME688)
                                     columns[0].group(|ui| {
                                         ui.label(RichText::new("💨 Gas Chamber (BME688)").size(16.0).strong().color(Color32::from_rgb(46, 204, 113)));
-                                        ui.add_space(5.0);
-                                        
-                                        // Temperature
-                                        ui.label(RichText::new("Temperature (°C)").strong());
-                                        let temp_points: PlotPoints = env_data.iter()
-                                            .map(|d| [d.timestamp, d.sample_temp])
-                                            .collect();
-                                        
-                                        Plot::new("sample_temp_plot")
-                                            .height(self.graph_height)
-                                            .show_axes([true, true])
-                                            .show_grid([true, true])
-                                            .allow_zoom(true)
-                                            .allow_drag(true)
-                                            .show(ui, |plot_ui| {
-                                                plot_ui.line(
-                                                    Line::new(temp_points)
-                                                        .name("Temperature")
-                                                        .color(Color32::from_rgb(231, 76, 60))
-                                                        .width(2.5)
-                                                );
-                                            });
-                                        
                                         ui.add_space(10.0);
                                         
-                                        // Humidity
-                                        ui.label(RichText::new("Humidity (%)").strong());
-                                        let humid_points: PlotPoints = env_data.iter()
-                                            .map(|d| [d.timestamp, d.sample_humid])
-                                            .collect();
-                                        
-                                        Plot::new("sample_humid_plot")
-                                            .height(self.graph_height)
-                                            .show_axes([true, true])
-                                            .show_grid([true, true])
-                                            .allow_zoom(true)
-                                            .allow_drag(true)
-                                            .show(ui, |plot_ui| {
-                                                plot_ui.line(
-                                                    Line::new(humid_points)
-                                                        .name("Humidity")
-                                                        .color(Color32::from_rgb(52, 152, 219))
-                                                        .width(2.5)
-                                                );
-                                            });
+                                        if let Some(latest) = env_data.last() {
+                                            ui.label(RichText::new(format!("Temperature: {:.2}°C", latest.sample_temp))
+                                                .size(14.0)
+                                                .color(Color32::from_rgb(231, 76, 60)));
+                                            ui.label(RichText::new(format!("Humidity: {:.2}%", latest.sample_humid))
+                                                .size(14.0)
+                                                .color(Color32::from_rgb(52, 152, 219)));
+                                        }
                                     });
                                     
-                                    // Column 2: Object Chamber (AHT25)
                                     columns[1].group(|ui| {
                                         ui.label(RichText::new("🌡️ Object Chamber (AHT25)").size(16.0).strong().color(Color32::from_rgb(155, 89, 182)));
-                                        ui.add_space(5.0);
-                                        
-                                        // Temperature
-                                        ui.label(RichText::new("Temperature (°C)").strong());
-                                        let temp_points: PlotPoints = env_data.iter()
-                                            .map(|d| [d.timestamp, d.chamber_temp])
-                                            .collect();
-                                        
-                                        Plot::new("chamber_temp_plot")
-                                            .height(self.graph_height)
-                                            .show_axes([true, true])
-                                            .show_grid([true, true])
-                                            .allow_zoom(true)
-                                            .allow_drag(true)
-                                            .show(ui, |plot_ui| {
-                                                plot_ui.line(
-                                                    Line::new(temp_points)
-                                                        .name("Temperature")
-                                                        .color(Color32::from_rgb(241, 196, 15))
-                                                        .width(2.5)
-                                                );
-                                            });
-                                        
                                         ui.add_space(10.0);
                                         
-                                        // Humidity
-                                        ui.label(RichText::new("Humidity (%)").strong());
-                                        let humid_points: PlotPoints = env_data.iter()
-                                            .map(|d| [d.timestamp, d.chamber_humid])
-                                            .collect();
-                                        
-                                        Plot::new("chamber_humid_plot")
-                                            .height(self.graph_height)
-                                            .show_axes([true, true])
-                                            .show_grid([true, true])
-                                            .allow_zoom(true)
-                                            .allow_drag(true)
-                                            .show(ui, |plot_ui| {
-                                                plot_ui.line(
-                                                    Line::new(humid_points)
-                                                        .name("Humidity")
-                                                        .color(Color32::from_rgb(52, 152, 219))
-                                                        .width(2.5)
-                                                );
-                                            });
+                                        if let Some(latest) = env_data.last() {
+                                            ui.label(RichText::new(format!("Temperature: {:.2}°C", latest.chamber_temp))
+                                                .size(14.0)
+                                                .color(Color32::from_rgb(241, 196, 15)));
+                                            ui.label(RichText::new(format!("Humidity: {:.2}%", latest.chamber_humid))
+                                                .size(14.0)
+                                                .color(Color32::from_rgb(52, 152, 219)));
+                                        }
                                     });
                                 });
                                 
@@ -1106,7 +1050,6 @@ impl eframe::App for SerialMonitorApp {
                             }
                         }
                         
-                        // Gas Sensor Graphs
                         if self.show_graph && !self.channels.is_empty() {
                             egui::Frame::group(ui.style())
                                 .inner_margin(10.0)
@@ -1116,14 +1059,14 @@ impl eframe::App for SerialMonitorApp {
                                     
                                     Plot::new("main_sensor_plot")
                                         .height(self.graph_height)
-                                        .legend(Legend::default()
-                                            .position(Corner::RightTop)
-                                            .background_alpha(0.95))
                                         .show_axes([true, true])
                                         .show_grid([true, true])
-                                        .allow_zoom(true)
-                                        .allow_drag(true)
-                                        .allow_scroll(true)
+                                        .allow_zoom(false)
+                                        .allow_drag(false)
+                                        .allow_scroll(false)
+                                        .auto_bounds_x()
+                                        .auto_bounds_y()
+                                        .y_axis_label("Voltage (mV)")
                                         .show(ui, |plot_ui| {
                                             for (name, channel) in &self.channels {
                                                 if channel.visible && !channel.points.is_empty() {
@@ -1141,6 +1084,25 @@ impl eframe::App for SerialMonitorApp {
                                                 }
                                             }
                                         });
+                                    
+                                    // ✅ LEGEND HORIZONTAL DI BAWAH GRAFIK
+                                    ui.add_space(15.0);
+                                    ui.label(RichText::new("📡 Active Sensor Channels:").size(14.0).strong());
+                                    ui.add_space(8.0);
+                                    
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 15.0;
+                                        
+                                        for (name, channel) in &self.channels {
+                                            if channel.visible {
+                                                ui.label(
+                                                    RichText::new(format!("● {}", name))
+                                                        .size(12.0)
+                                                        .color(channel.color)
+                                                );
+                                            }
+                                        }
+                                    });
                                 });
                         }
                         
